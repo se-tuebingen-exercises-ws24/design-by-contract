@@ -11,12 +11,27 @@ def demo(m: MutableMap[Int]) = {
   m.put("a", 1)
   assert(m.get("a") == 1)
 
+  //  shouldThrowIllegalArgumentException {
+  //    m.put("", 42)
+  //  }
+
   assert(m.contains("a") == true)
   assert(m.contains("b") == false)
 }
 
+// by name parameter
+def shouldThrowIllegalArgumentException(prog: => Unit): Unit =
+  try {
+    prog
+    assert(false, "Should have thrown")
+  } catch {
+    case exc: IllegalArgumentException => ()
+    case e: AssertionError => throw e
+    case e => assert(false, "Wrong exception")
+  }
+
 @main
-def mainContracts() = demo(ImmutableHashMap())
+def mainContracts() = demo(MoreEfficientListMapContract())
 
 
 
@@ -119,7 +134,14 @@ class ImmutableHashMap[V] extends MutableMap[V] {
 
 
 
-
+// We can understand { ... } ensuring { x => P(x) } as
+//   myEnsuring({ () => ... })(x => P(x))
+// with the following implementation.
+def myEnsuring[R](prog: () => R)(pred: R => Boolean): R = {
+  val result = prog()
+  assert(pred(result))
+  result
+}
 
 /**
  * Implementation of [[MutableMap]] backed by a [[immutable.HashMap]].
@@ -129,10 +151,17 @@ class ImmutableHashMap[V] extends MutableMap[V] {
 class ImmutableHashMapContract[V] extends MutableMap[V] {
   private var entries: immutable.HashMap[String, V] = immutable.HashMap.empty
 
-  override def put(key: String, value: V): Unit = {
+  override def put(key: String, value: V): Unit = myEnsuring { () =>
     require(key != "", "Key must not be empty.") // it would be OK to omit this. Why? Discuss.
+
+    // Here we discussed that after checking the precondition, we can rely
+    // on the fact that key != ""
+    // The type checker in Scala does not know this, though. Other languages
+    // like TypeScript have "flow sensitive" types that reason about this.
+    if (key == "") { sys.error("unreachable") } else { () }
+
     entries = entries.updated(key, value)
-  } ensuring { result => contains(key) }
+  } { x => contains(key) }
 
   override def get(key: String): V = unchanged {
     require(key != "", "Key must not be empty.")
@@ -288,12 +317,30 @@ class MoreEfficientListMap[V] extends MutableMap[V] {
     case Entry(key: String, value: V, rest: Store)
   }
 
+  // invariant:
+  // exists v. get(m, x) = v   <==>   x in keys(m)
   private var entries: Store = Store.Empty
   private var keys: Set[String] = Set.empty
 
   override def put(key: String, value: V): Unit =
     entries = Store.Entry(key, value, entries)
+    // invariant is briefly violated
+    // vvvvvvvvvvvvvv
+    println("It would be bad if this state could be observed")
+    // ^^^^^^^^^^^^^^
+    // The next statement restores the invariant
     keys = keys + key
+    // we leave the function in a state where the invariant holds again...
+    // Please note: if we have parallelism (like when using preemptive multithreading)
+    // another process could call `get` in the very moment, where the invariant is violated.
+    // our implementation of `MutableMap` here is thus not "thread safe".
+    //
+    // Also: you need to be careful not to call other methods that rely on the
+    // invariant, before restoring it. For example:
+    //
+    //   entries = Store.Entry(key, value, entries) // destroy invariant
+    //   val entryAtKey = this.get(key)             // `get` relies on invariant
+    //   keys = keys + key                          // restore invariant
 
   override def get(key: String): V =
     if (!keys.contains(key)) throw new EntryNotFoundException(key)
@@ -393,12 +440,12 @@ class MoreEfficientListMapContract[V] extends MutableMap[V] {
     }
 
   @tailrec
-  private def allKeys(store: Store, keys: Set[String] = Set.empty): Set[String] = store match {
+  private def allKeys(store: Store, keys: Set[String]): Set[String] = store match {
     case Store.Empty => keys
     case Store.Entry(key, value, rest) => allKeys(rest, keys + key)
   }
 
-  private def invariant(): Unit = assert(allKeys(entries) == keys)
+  private def invariant(): Unit = assert(allKeys(entries, Set.empty) == keys)
 
   private def unchanged[A](block: => A): A =
     val entriesBefore = entries
